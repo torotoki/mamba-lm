@@ -55,7 +55,6 @@ class MambaBlock(GradientCheckpointingLayer):
         self.d_inner = int(config.expand * config.d_model)
 
         # convolution sequence transformation layer
-        # (not explained in the paper)
         self.seq_conv1d = nn.Conv1d(
             in_channels=config.conv_dim,
             out_channels=config.d_inner,
@@ -64,54 +63,49 @@ class MambaBlock(GradientCheckpointingLayer):
             padding=config.d_conv - 1,
         )
 
-        # S4D initialization in continuous-time, will be discreted.
-        # self.log_A: [config.d_state, config.d_model]
-        A = torch.arange(1, config.d_state + 1, dtype=torch.float32)
-        A = A.expand(config.d_model, -1).contiguous()
-        self.log_A = nn.Parameter(torch.log(A))
-
         # selective projections for the input and the hidden layer
-        # TODO: they might be the same linear layer
-        self.B_layer = nn.Linear(config.d_model, self.d_inner)
-        self.C_layer = nn.Linear(config.d_model, self.d_inner)
+        self.to_params = nn.Linear(config.d_model, 3 * self.d_inner)
 
-        # time-step projection (discretization)
-        self.Delta_layer = nn.Linear(config.d_model, self.d_model)
+        # The eigenvalues of A in continuous-time
+        lam = torch.arange(1, config.d_state + 1, dtype=torch.float32)
+        self.lam = nn.Parameter(lam)
+
+        # Output projection
+        self.out = nn.Linear(config.d_model, config.d_model)
+
+    def forward(self, x: torch.Tensor):
+        # x: (B, T, D)
+        B, T, D = x.shape
         
-        # Linear-recurrence-based State Space Model
+        # 1. Depth-wise convolution
+        input_states = self.seq_conv1d(input_states)
 
+        # 2. Gated MLP's linear projection
+        dlt, Bt, Ct = self.to_params(input_states).chunk(3, dim=-1)
 
+        # Stabilization
+        dlt = F.softplus(dlt)         # \Delta_t > 0
+        lam = -F.softplus(self.lam)   # \lambd a< 0  (D,)
 
-    def forward(self, input_states: torch.Tensor, attention_mask: torch.Tensor | None = None):
-        batch_size, seq_len, _ = input_states.shape
-        dtype = input_states.dtype
-        
-        # 1. Gated MLP's linear projection
-        B_states = self.B_layer(input_states)
-        C_states = self.C_layer(input_states)
-        Delta_states = self.Delta_layer(input_states)
-        
-        if attention_mask is not None:
-            hidden_states = hidden_states * attention_mask.unsqueeze(1)
+        # 3. Autoregressive State-Space Models (SSM)        
+        ht = torch.zeros(B, D, device=x.device, dtype=x.dtype)
+        ys = []
+        for t in range(T):
+            # NOTE: dlt and x can be transposed for faster computation
+            dt = dlt[:, t, :]                        # (B,D)
+            At_diag = torch.exp(dt * lam)            # (B,D) ← lam (D,) is broadcasted
+            Bt_bar = torch.where(
+                lam.abs() > 1e-4,
+                ((At_diag - 1.0) / lam) * Bt[:, t, :],
+                dt * Bt[:, t, :]
+            )                                        # (B,D)
+            ht = At_diag * ht + Bt_bar * x[:, t, :]  # (B,D)
+            y = Ct[:, t, :] * ht
+            ys.append(y)
+        y = torch.stack(ys, dim=1)                   # (B,T,D)
 
-        # 2. Convolution sequence transformation (ナニコレ)
-        hidden_states = self.activation(
-            self.conv1d(hidden_states)[..., :seq_len]
-        )
-        if attention_mask is not None:
-            hidden_states = hidden_states * attention_mask.unsqueeze(1)
-
-        # 3. State Space Model sequence transformation
-
-        # 3.a. Selection: [batch, seq_len, self.time_step_rank + self.ssm_state_size * 2]
-
-        # 3.b. Discretization: B and C to [batch, seq_len, self.d_inner, ssm_state_size]
-        # A: [batch, d_model, seq_len, ssm_state_size]
-        A = torch.exp(self.log_A)
-        discrete_A = torch.exp(A[None, :, None]
-        # 3.c perform the recurrence y <- SSM(A, B, C)(x)
         # 4. Final linear projection
-        pass
+        return self.out(y)
 
 class MambaOutput(ModelOutput):
     loss: torch.FloatTensor | None = None
