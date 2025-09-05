@@ -1,5 +1,5 @@
 # mamba-lm
-
+## Mamba Architecture Overview
 ![architecture](images/architecture_overview.png)
 
 # References
