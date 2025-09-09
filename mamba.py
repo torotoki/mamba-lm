@@ -1,14 +1,10 @@
 import math
-from typing import Optional
+from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from transformers import AutoTokenizer, DataCollatorWithPadding, Trainer, TrainingArguments
-from datasets import Dataset
-
-import numpy as np
-from sklearn.metrics import accuracy_score, f1_score
 
 from transformers import PreTrainedModel, PretrainedConfig
 from transformers.modeling_layers import GradientCheckpointingLayer
@@ -18,12 +14,11 @@ class MambaConfig(PretrainedConfig):
     model_type = "mamba-impl"
     def __init__(
         self,
-        d_model,
+        d_model=128,
         vocab_size=30522,
         num_hidden_layers=4,
         d_ssm_state_size=16,
         d_conv=4,
-        expand=2,
         time_step_rank="auto",
         dt_min=0.001,
         dt_max=0.1,
@@ -32,14 +27,13 @@ class MambaConfig(PretrainedConfig):
         **kwargs
     ):
         super().__init__(**kwargs)
-        if time_step_rank is "auto":
+        if time_step_rank == "auto":
             time_step_rank = math.ceil(d_model / 16)
         self.d_model = d_model
         self.vocab_size = vocab_size
-        self.num_hidden_layers = 4
+        self.num_hidden_layers = num_hidden_layers
         self.d_ssm_state_size = d_ssm_state_size
         self.d_conv = d_conv
-        self.expand = expand
         # time-step-related arguments:
         self.time_step_rank = time_step_rank
         self.dt_min = dt_min
@@ -52,42 +46,50 @@ class MambaBlock(GradientCheckpointingLayer):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.d_inner = int(config.expand * config.d_model)
 
         # convolution sequence transformation layer
         self.seq_conv1d = nn.Conv1d(
-            in_channels=config.conv_dim,
-            out_channels=config.d_inner,
+            in_channels=config.d_model,
+            out_channels=config.d_model,
             kernel_size=config.d_conv,
-            groups=config.d_inner,
+            groups=config.d_model,
             padding=config.d_conv - 1,
         )
 
         # selective projections for the input and the hidden layer
-        self.to_params = nn.Linear(config.d_model, 3 * self.d_inner)
+        self.to_params = nn.Linear(config.d_model, 3 * config.d_model)
 
         # The eigenvalues of A in continuous-time
-        lam = torch.arange(1, config.d_state + 1, dtype=torch.float32)
+        lam = torch.arange(1, config.d_model + 1, dtype=torch.float32)
         self.lam = nn.Parameter(lam)
 
         # Output projection
+        self.norm = nn.RMSNorm(config.d_model)
         self.out = nn.Linear(config.d_model, config.d_model)
 
-    def forward(self, x: torch.Tensor):
-        # x: (B, T, D)
+    def forward(self, x: torch.Tensor, attention_mask: torch.LongTensor | None):
+        # x: (B, T, D ( = config.d_model))
+        # attention_mask: (B, T)
         B, T, D = x.shape
+        x = self.norm(x)
+
+        if attention_mask is not None:
+            # Add dimention to attention_mask for broadcasting
+            x = x * attention_mask.unsqueeze(2)
         
         # 1. Depth-wise convolution
-        input_states = self.seq_conv1d(input_states)
+        #   Swap the dimensions of x since
+        #   self.seq_conv1d expects the dimension (B, D, T)
+        hidden_states = self.seq_conv1d(x.transpose(1, 2)).transpose(1, 2)
 
         # 2. Gated MLP's linear projection
-        dlt, Bt, Ct = self.to_params(input_states).chunk(3, dim=-1)
+        dlt, Bt, Ct = self.to_params(hidden_states).chunk(3, dim=-1)
 
-        # Stabilization
+        # Stabilization using softplus
         dlt = F.softplus(dlt)         # \Delta_t > 0
         lam = -F.softplus(self.lam)   # \lambd a< 0  (D,)
 
-        # 3. Autoregressive State-Space Models (SSM)        
+        # 3. Autoregressive State-Space Models (SSM)
         ht = torch.zeros(B, D, device=x.device, dtype=x.dtype)
         ys = []
         for t in range(T):
@@ -107,9 +109,10 @@ class MambaBlock(GradientCheckpointingLayer):
         # 4. Final linear projection
         return self.out(y)
 
+@dataclass
 class MambaOutput(ModelOutput):
     loss: torch.FloatTensor | None = None
-    logits: torch.FloatTensort | None = None
+    logits: torch.FloatTensor | None = None
     hidden_states: torch.FloatTensor | None = None
 
 class Mamba(PreTrainedModel):
@@ -121,12 +124,35 @@ class Mamba(PreTrainedModel):
         self.layers = nn.ModuleList(
             [MambaBlock(config, layer_idx=idx) for idx in range(config.num_hidden_layers)]
         )
+        self.norm = nn.RMSNorm(config.d_model)
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
         self.loss_fn = nn.CrossEntropyLoss()
         self.post_init()  # Init weight (HF recommended)
 
-    def forward(self, input_ids):
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None):
         x = self.emb(input_ids)
+        for mamba_block in self.layers:
+            x = mamba_block(x, attention_mask)
+        
+        x = self.norm(x)
+        logits = self.lm_head(x)
+        
+        labels = input_ids
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        # Flatten the tokens
+        loss = self.loss_fn(
+            shift_logits.view(-1, shift_logits.size(-1)),  # (B * T, vocab_size)
+            shift_labels.view(-1)  # (B * T,)
+        )
+
+        print(loss)
+        return MambaOutput(
+            loss=loss,
+            logits=logits,
+        )
+        
         
     def get_input_embeddings(self):
         return self.emb
@@ -174,8 +200,8 @@ args = TrainingArguments(
     per_device_eval_batch_size=8,
     num_train_epochs=3,
     eval_strategy="epoch",
-    save_strategy="epoch",
-    logging_steps=10,
+    save_strategy="no",  #TODO: epoch
+    logging_steps=1,
     fp16=torch.cuda.is_available(),
 )
 
