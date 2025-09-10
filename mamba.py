@@ -53,14 +53,15 @@ class MambaBlock(GradientCheckpointingLayer):
             out_channels=config.d_model,
             kernel_size=config.d_conv,
             groups=config.d_model,
-            padding=config.d_conv - 1,
+            padding=0,
+            bias=False
         )
 
         # selective projections for the input and the hidden layer
         self.to_params = nn.Linear(config.d_model, 3 * config.d_model)
 
         # The eigenvalues of A in continuous-time
-        lam = torch.arange(1, config.d_model + 1, dtype=torch.float32)
+        lam = torch.arange(1, config.d_model + 1, dtype=torch.float32) * 0.1
         self.lam = nn.Parameter(lam)
 
         # Output projection
@@ -80,7 +81,11 @@ class MambaBlock(GradientCheckpointingLayer):
         # 1. Depth-wise convolution
         #   Swap the dimensions of x since
         #   self.seq_conv1d expects the dimension (B, D, T)
-        hidden_states = self.seq_conv1d(x.transpose(1, 2)).transpose(1, 2)
+        xT = x.transpose(1,2)        # (B, D, T)
+        k = self.config.d_conv
+        xT = F.pad(xT, (k - 1, 0))   # left-most padding
+        hidden_states = self.seq_conv1d(xT)
+        hidden_states = hidden_states.transpose(1, 2)
 
         # 2. Gated MLP's linear projection
         dlt, Bt, Ct = self.to_params(hidden_states).chunk(3, dim=-1)
@@ -117,6 +122,7 @@ class MambaOutput(ModelOutput):
 
 class Mamba(PreTrainedModel):
     config_class = MambaConfig
+    _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config: MambaConfig):
         super().__init__(config)
@@ -130,7 +136,7 @@ class Mamba(PreTrainedModel):
         self.loss_fn = nn.CrossEntropyLoss()
         self.post_init()  # Init weight (HF recommended)
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None):
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None, labels = None):
         x = self.emb(input_ids)
         for mamba_block in self.layers:
             x = mamba_block(x, attention_mask)
@@ -138,16 +144,22 @@ class Mamba(PreTrainedModel):
         x = self.norm(x)
         logits = self.lm_head(x)
         
-        labels = input_ids
+        if labels is None:
+            labels = input_ids
+
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
+
+        if attention_mask is not None:
+            shift_attention_mask = attention_mask[..., 1:].contiguous()
+            shift_labels = shift_labels.masked_fill(shift_attention_mask == 0, -100)
+
         # Flatten the tokens
         loss = self.loss_fn(
             shift_logits.view(-1, shift_logits.size(-1)),  # (B * T, vocab_size)
             shift_labels.view(-1)  # (B * T,)
         )
 
-        print(loss)
         return MambaOutput(
             loss=loss,
             logits=logits,
@@ -168,6 +180,7 @@ class Mamba(PreTrainedModel):
             old_emb.weight.data[:min(old_emb.num_embeddings, new_num_tokens)]
         self.set_input_embeddings(new_emb)
         self.config.vocab_size = new_num_tokens
+        self.tie_weights()
         return self.get_input_embeddings()
 
 
@@ -182,7 +195,7 @@ texts = [
     "Smashing the mics in the bar",
     "custom transformer model works",
     "trainer rocks",
-    "pytorch fun"
+    "pytorch is fun"
 ]
 
 def encode(ex):
@@ -191,18 +204,19 @@ def encode(ex):
 ds = Dataset.from_dict({"text": texts}).map(encode)
 collator = DataCollatorWithPadding(tokenizer=tok)
 
-config = MambaConfig(vocab_size=tok.vocab_size, d_model=128, nhead=4, num_layers=2, num_labels=2)
+config = MambaConfig(vocab_size=tok.vocab_size, d_model=128, num_hidden_layers=2)
 model = Mamba(config)
 
 args = TrainingArguments(
     output_dir="out-custom",
-    per_device_train_batch_size=8,
-    per_device_eval_batch_size=8,
-    num_train_epochs=3,
+    per_device_train_batch_size=2,
+    per_device_eval_batch_size=2,
+    num_train_epochs=1000,
     eval_strategy="epoch",
     save_strategy="no",  #TODO: epoch
     logging_steps=1,
-    fp16=torch.cuda.is_available(),
+    fp16=False,
+    report_to="wandb"
 )
 
 trainer = Trainer(
