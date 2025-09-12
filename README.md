@@ -1,8 +1,5 @@
 # mamba-lm
 A minimal implementation of Mamba in PyTorch and huggingface libraries.
-
-
-## Mamba Architecture Overview
 ![architecture](images/architecture_overview.png)
 
 ## Experiments
