@@ -1,6 +1,8 @@
 # mamba-lm
 A minimal implementation of Mamba in PyTorch and huggingface libraries.
-![architecture](images/architecture_overview.png)
+
+## Architecture Diagram
+<img src="images/architecture_overview.png" alt="architecture" style="border: 1px solid #333; border-radius: 8px;" />
 
 ## Experiments
 The loss curve from an experiment using artificial data:
