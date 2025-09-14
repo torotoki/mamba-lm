@@ -1,6 +1,8 @@
 # mamba-lm
 A minimal implementation of Mamba in PyTorch and Hugging Face Transformers.
 
+See also my blog articles: [English on Medium](https://medium.com/@torotoki0329soft/getting-started-with-mamba-implementing-mamba-in-pytorch-33d56ccd8393), [Japanese on Qiita](https://qiita.com/torotoki/items/97aae3116e8178851697).
+
 ## Architecture Diagram
 <img src="images/architecture_overview.png" alt="architecture" style="border: 2px solid #333; border-radius: 8px;" />
 
